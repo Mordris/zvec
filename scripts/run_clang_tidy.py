@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run clang-tidy on staged C/C++ files, for use as a pre-commit hook.
+"""Run clang-tidy on changed C/C++ files, for use as a pre-push hook.
 
 This mirrors the CI clang-tidy check (``.github/workflows/clang_tidy.yml``):
 only files that appear in the CMake compilation database are analysed, using
@@ -9,16 +9,17 @@ green local hook is a good predictor of a green CI run.
 
 The hook degrades gracefully. If clang-tidy or the compilation database is not
 available it prints how to enable the check and exits 0, so contributors who
-have not configured a build are never blocked from committing -- CI stays the
-hard gate. Set ``ZVEC_CLANG_TIDY_STRICT=1`` to turn those skips into failures.
+have not configured a build are never blocked from pushing -- CI stays the
+hard gate.
+
+The compilation database is located flexibly (see ``_find_build_dir``): the
+repo root wins outright, otherwise the configured/well-known build directories
+are tried, falling back to a shallow scan of the working tree.
 
 Configuration via environment variables:
-  CLANG_TIDY   clang-tidy executable to use (default: first of ``clang-tidy``,
-               ``clang-tidy-18`` found on PATH).
-  BUILD_DIR    directory holding ``compile_commands.json`` (default: ``build``).
-  ZVEC_CLANG_TIDY_STRICT
-               when set to ``1``/``true``/``yes``, missing tooling is an error,
-               not a skip.
+  BUILD_DIR    preferred directory holding ``compile_commands.json``. When
+               unset the well-known ``build`` / ``build.release`` /
+               ``build.debug`` directories are tried instead.
 """
 
 from __future__ import annotations
@@ -30,49 +31,28 @@ import subprocess
 import sys
 from pathlib import Path
 
-# clang-tidy binaries to look for, in order, when CLANG_TIDY is unset.
-CLANG_TIDY_CANDIDATES = ("clang-tidy", "clang-tidy-18")
+# Well-known build directories to probe when BUILD_DIR is unset.
+BUILD_DIR_CANDIDATES = ("build", "build.release", "build.debug")
 
-PREFIX = "clang-tidy pre-commit"
+PREFIX = "clang-tidy pre-push"
 
 
 def _log(message: str) -> None:
     sys.stderr.write(f"{message}\n")
 
 
-def _strict() -> bool:
-    return os.environ.get("ZVEC_CLANG_TIDY_STRICT", "").lower() in ("1", "true", "yes")
-
-
 def _skip(message: str) -> int:
-    """Report a reason the check could not run.
+    """Report a reason the check could not run, then let the push proceed.
 
-    Returns 0 (skip) normally, or 1 when strict mode is enabled.
+    CI remains the hard gate, so a missing local build never blocks a push.
     """
-    if _strict():
-        _log(f"{PREFIX}: {message}")
-        return 1
     _log(f"{PREFIX}: {message} -- skipping.")
     return 0
 
 
-def _find_clang_tidy() -> str | None:
-    override = os.environ.get("CLANG_TIDY")
-    if override:
-        return override if shutil.which(override) else None
-    for candidate in CLANG_TIDY_CANDIDATES:
-        if shutil.which(candidate):
-            return candidate
-    return None
-
-
 def _normalize(path: Path) -> str:
     """Absolute, symlink-resolved, case-normalized path for reliable matching."""
-    try:
-        resolved = path.resolve()
-    except OSError:
-        resolved = path.absolute()
-    return os.path.normcase(str(resolved))
+    return os.path.normcase(str(path.resolve()))
 
 
 def _compile_db_files(build_dir: Path) -> set[str]:
@@ -97,23 +77,49 @@ def _compile_db_files(build_dir: Path) -> set[str]:
     return files
 
 
+def _find_build_dir() -> Path | None:
+    """Locate the directory that holds ``compile_commands.json``.
+
+    Discovery order:
+      1. the repo root -- if it holds the database, use it and stop.
+      2. ``$BUILD_DIR`` when set, else the well-known build directories.
+      3. a shallow glob of the working tree, up to two levels deep.
+    """
+    if Path("compile_commands.json").is_file():
+        return Path()
+
+    override = os.environ.get("BUILD_DIR")
+    candidates = (
+        [Path(override)] if override else [Path(c) for c in BUILD_DIR_CANDIDATES]
+    )
+    for candidate in candidates:
+        if (candidate / "compile_commands.json").is_file():
+            return candidate
+
+    for pattern in ("*/compile_commands.json", "*/*/compile_commands.json"):
+        for hit in sorted(Path().glob(pattern)):
+            # Skip dot-directories (.git, .cache, ...); pathlib glob matches them.
+            if not any(part.startswith(".") for part in hit.parent.parts):
+                return hit.parent
+    return None
+
+
 def main(argv: list[str]) -> int:
     files = [Path(arg) for arg in argv[1:]]
     if not files:
         return 0
 
-    clang_tidy = _find_clang_tidy()
+    clang_tidy = shutil.which("clang-tidy")
     if clang_tidy is None:
-        hint = os.environ.get("CLANG_TIDY", " or ".join(CLANG_TIDY_CANDIDATES))
-        return _skip(f"could not find clang-tidy ({hint}) on PATH")
+        return _skip("could not find clang-tidy on PATH")
 
-    build_dir = Path(os.environ.get("BUILD_DIR", "build"))
-    db_path = build_dir / "compile_commands.json"
-    if not db_path.is_file():
+    build_dir = _find_build_dir()
+    if build_dir is None:
         return _skip(
-            f"no compilation database at {db_path}. Configure a build with "
-            "`cmake -S . -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON`"
+            "no compilation database (compile_commands.json) found. Configure a "
+            "build with `cmake -S . -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON`"
         )
+    db_path = build_dir / "compile_commands.json"
 
     try:
         db_files = _compile_db_files(build_dir)
